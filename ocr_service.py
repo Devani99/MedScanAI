@@ -1,4 +1,3 @@
-import json
 import streamlit as st
 from paddleocr import PaddleOCR
 
@@ -7,7 +6,8 @@ from paddleocr import PaddleOCR
 def get_ocr():
 
     return PaddleOCR(
-        lang="en"
+        lang="en",
+        use_angle_cls=True
     )
 
 
@@ -15,50 +15,57 @@ def extract_medicine_text(image_path: str) -> str:
 
     ocr = get_ocr()
 
-    result = ocr.ocr(
-        image_path,
-        cls=False
-    )
+    try:
 
-    extracted_text = []
+        result = ocr.ocr(
+            image_path,
+            cls=True
+        )
 
-    if not result:
-        return ""
+        if not result:
+            return ""
 
-    for page in result:
+        extracted_text = []
 
-        if not page:
-            continue
+        for page in result:
 
-        for line in page:
-
-            if len(line) < 2:
+            if not page:
                 continue
 
-            text_info = line[1]
+            for line in page:
 
-            if not text_info:
-                continue
+                if not line or len(line) < 2:
+                    continue
 
-            text = text_info[0]
+                text_info = line[1]
 
-            score = float(
-                text_info[1]
-            )
+                if not text_info:
+                    continue
 
-            text = str(
-                text
-            ).strip()
+                text = str(
+                    text_info[0]
+                ).strip()
 
-            if not text:
-                continue
-
-            if score >= 0.50:
-
-                extracted_text.append(
-                    text
+                score = float(
+                    text_info[1]
                 )
 
-    return "\n".join(
-        extracted_text
-    )
+                if (
+                    text
+                    and score >= 0.50
+                ):
+                    extracted_text.append(
+                        text
+                    )
+
+        return "\n".join(
+            extracted_text
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"OCR processing failed: {str(e)}"
+        )
+
+        raise
