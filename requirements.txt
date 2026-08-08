@@ -15,6 +15,7 @@ langgraph
 langsmith
 
 google-generativeai
+langchain_tavily
 
 requests
 beautifulsoup4
