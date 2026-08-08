@@ -17,3 +17,11 @@ except Exception as e:
     st.error("PaddlePaddle failed")
     st.exception(e)
     st.stop()
+
+try:
+    from paddleocr import PaddleOCR
+    st.success("PaddleOCR imported successfully")
+except Exception as e:
+    st.error("PaddleOCR failed")
+    st.exception(e)
+    st.stop()
