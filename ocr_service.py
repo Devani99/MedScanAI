@@ -1,24 +1,16 @@
 import streamlit as st
 from paddleocr import PaddleOCR
-import os
 
 
 @st.cache_resource
 def get_ocr():
 
-    use_gpu = os.getenv(
-        "MEDSCAN_USE_GPU",
-        "false"
-    ).lower() == "true"
-
     return PaddleOCR(
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        lang="en",
-        use_gpu=use_gpu
+        lang="en"
     )
-
 
 
 def extract_medicine_text(image_path: str) -> str:
@@ -88,4 +80,4 @@ def extract_medicine_text(image_path: str) -> str:
 
     return "\n".join(
         extracted_text
-    )   
+    )
