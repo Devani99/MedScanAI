@@ -1,8 +1,24 @@
 import os
-import tempfile
-
 import streamlit as st
 
+os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+
+os.environ["TAVILY_API_KEY"] = st.secrets["TAVILY_API_KEY"]
+
+os.environ["LANGSMITH_TRACING"] = st.secrets.get(
+    "LANGSMITH_TRACING",
+    "true"
+)
+
+os.environ["LANGSMITH_API_KEY"] = st.secrets["LANGSMITH_API_KEY"]
+
+os.environ["LANGSMITH_PROJECT"] = st.secrets.get(
+    "LANGSMITH_PROJECT",
+    "MedScan-AI-Agent"
+)
+
+
+import tempfile
 from ocr_service import extract_medicine_text
 from medicine_identifier import identify_medicine
 from medicine_agent import research_medicine
