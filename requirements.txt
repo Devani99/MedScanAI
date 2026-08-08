@@ -1,15 +1,2 @@
 streamlit==1.61.1
-paddleocr==2.10.0
-paddlepaddle==3.3.1
-opencv-python
-python-dotenv
-pydantic
-langchain
-langchain-core
-langchain_tavily
-langchain-google-genai
-langgraph
-langsmith
-google-generativeai
-requests
-beautifulsoup4
+opencv-python-headless==4.12.0.88
