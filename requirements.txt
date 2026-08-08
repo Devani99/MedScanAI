@@ -1,27 +1,8 @@
 streamlit==1.61.1
 
-opencv-python-headless==4.12.0.88
 paddlepaddle==3.3.1
-
-paddleocr==2.10.0
-langchain_tavily
-shapely
-scikit-image
-pyclipper
-lmdb
-tqdm
-numpy
-rapidfuzz
-cython
-Pillow
-PyYAML
-python-docx
-beautifulsoup4
-fonttools>=4.24.0
-fire>=0.3.0
-requests
-albumentations
-albucore
+paddleocr==3.3.2
+opencv-python-headless==4.12.0.88
 
 python-dotenv
 pydantic
@@ -29,6 +10,10 @@ pydantic
 langchain
 langchain-core
 langchain-google-genai
+langchain-tavily
 langgraph
 langsmith
 google-generativeai
+
+requests
+beautifulsoup4
