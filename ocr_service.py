@@ -1,13 +1,12 @@
+import json
 import streamlit as st
 from paddleocr import PaddleOCR
 
 
 @st.cache_resource
 def get_ocr():
-
     return PaddleOCR(
-        lang="en",
-        use_angle_cls=True
+        lang="en"
     )
 
 
@@ -16,51 +15,43 @@ def extract_medicine_text(image_path: str) -> str:
     ocr = get_ocr()
 
     try:
-
-        result = ocr.ocr(
-            image_path,
-            cls=True
-        )
-
-        if not result:
-            return ""
+        results = ocr.predict(image_path)
 
         extracted_text = []
 
-        for page in result:
+        for result in results:
 
-            if not page:
-                continue
+            data = result.json
 
-            for line in page:
+            if callable(data):
+                data = data()
 
-                if not line or len(line) < 2:
+            if isinstance(data, str):
+                data = json.loads(data)
+
+            texts = data.get("rec_texts", [])
+
+            scores = data.get(
+                "rec_scores",
+                []
+            )
+
+            for i, text in enumerate(texts):
+
+                text = str(text).strip()
+
+                if not text:
                     continue
 
-                text_info = line[1]
+                score = 1.0
 
-                if not text_info:
-                    continue
+                if i < len(scores):
+                    score = float(scores[i])
 
-                text = str(
-                    text_info[0]
-                ).strip()
+                if score >= 0.50:
+                    extracted_text.append(text)
 
-                score = float(
-                    text_info[1]
-                )
-
-                if (
-                    text
-                    and score >= 0.50
-                ):
-                    extracted_text.append(
-                        text
-                    )
-
-        return "\n".join(
-            extracted_text
-        )
+        return "\n".join(extracted_text)
 
     except Exception as e:
 
