@@ -1,0 +1,14 @@
+streamlit
+paddleocr
+paddlepaddle
+opencv-python-headless
+python-dotenv
+pydantic
+langchain
+langchain-core
+langchain-google-genai
+langgraph
+langsmith
+google-generativeai
+requests
+beautifulsoup4
