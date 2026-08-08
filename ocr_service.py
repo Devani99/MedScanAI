@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 from paddleocr import PaddleOCR
 
@@ -6,9 +7,6 @@ from paddleocr import PaddleOCR
 def get_ocr():
 
     return PaddleOCR(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
         lang="en"
     )
 
@@ -17,44 +15,36 @@ def extract_medicine_text(image_path: str) -> str:
 
     ocr = get_ocr()
 
-    result = ocr.predict(
-        image_path
+    result = ocr.ocr(
+        image_path,
+        cls=False
     )
 
     extracted_text = []
 
-    for item in result:
+    if not result:
+        return ""
 
-        data = item
+    for page in result:
 
-        if hasattr(item, "json"):
-            data = item.json
-
-        if isinstance(data, str):
-
-            import json
-
-            data = json.loads(data)
-
-        if not isinstance(data, dict):
+        if not page:
             continue
 
-        data = data.get(
-            "res",
-            data
-        )
+        for line in page:
 
-        texts = data.get(
-            "rec_texts",
-            []
-        )
+            if len(line) < 2:
+                continue
 
-        scores = data.get(
-            "rec_scores",
-            []
-        )
+            text_info = line[1]
 
-        for i, text in enumerate(texts):
+            if not text_info:
+                continue
+
+            text = text_info[0]
+
+            score = float(
+                text_info[1]
+            )
 
             text = str(
                 text
@@ -63,16 +53,7 @@ def extract_medicine_text(image_path: str) -> str:
             if not text:
                 continue
 
-            score = (
-                float(scores[i])
-                if i < len(scores)
-                else None
-            )
-
-            if (
-                score is None
-                or score >= 0.50
-            ):
+            if score >= 0.50:
 
                 extracted_text.append(
                     text
