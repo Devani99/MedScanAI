@@ -1,134 +1,81 @@
-"""MedScan AI medicine research agent.
+"""MedScanAI medicine research agent.
 
 Stack:
-- Gemini via LangChain
+- Gemini 3.1 Flash-Lite via LangChain
 - Tavily web retrieval
 - LangGraph orchestration
-- LangSmith tracing (configured through environment variables)
+- LangSmith tracing (optional, configured through environment variables)
 
-The agent performs live retrieval, source grading, evidence-grounded synthesis,
-self-checking, targeted corrective retrieval, re-synthesis, final validation,
-and user-facing cleanup.
+Workflow:
+  build_query → search → evaluate_sources → synthesize →
+  self_check → (corrective loop) → validate → extract_sources →
+  clean_output → END
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Literal, Optional, TypedDict
+from typing import Optional
 from urllib.parse import urlparse
 
+import streamlit as st
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 
-load_dotenv()
-
-Confidence = Literal["high", "medium", "low"]
-
-
-# -----------------------------------------------------------------------------
-# Schemas
-# -----------------------------------------------------------------------------
-
-class Ingredient(BaseModel):
-    name: str
-    strength: Optional[str] = None
-
-
-class MedicineIdentity(BaseModel):
-    brand_name: Optional[str] = None
-    active_ingredients: list[Ingredient] = Field(default_factory=list)
-    manufacturer: Optional[str] = None
-    dosage_form: Optional[str] = None
-    prescription_status: Optional[str] = None
-    confidence: Optional[Confidence] = None
-
-
-class SourceInfo(BaseModel):
-    title: Optional[str] = None
-    url: Optional[str] = None
-    domain: Optional[str] = None
-
-
-class SourceEvaluation(BaseModel):
-    selected_indices: list[int] = Field(default_factory=list)
-    reason: Optional[str] = None
-
-
-class MedicineInformation(BaseModel):
-    medicine_name: Optional[str] = None
-    generic_name: Optional[str] = None
-    strength: Optional[str] = None
-    dosage_form: Optional[str] = None
-    what_is_it: Optional[str] = None
-    uses: list[str] = Field(default_factory=list)
-    how_it_works: Optional[str] = None
-    how_to_take: Optional[str] = None
-    important_precautions: list[str] = Field(default_factory=list)
-    possible_side_effects: list[str] = Field(default_factory=list)
-    drug_interactions: list[str] = Field(default_factory=list)
-    overdose_risks: list[str] = Field(default_factory=list)
-    when_to_seek_medical_help: list[str] = Field(default_factory=list)
-    storage: Optional[str] = None
-    confidence: Confidence = "low"
-
-
-class SelfCheckResult(BaseModel):
-    is_sufficient: bool
-    unsupported_fields: list[str] = Field(default_factory=list)
-    missing_important_fields: list[str] = Field(default_factory=list)
-    issues: list[str] = Field(default_factory=list)
-    corrective_search_terms: list[str] = Field(default_factory=list)
-    confidence: Confidence = "low"
-
-
-class ValidationResult(BaseModel):
-    is_sufficient: bool
-    unsupported_fields: list[str] = Field(default_factory=list)
-    missing_fields: list[str] = Field(default_factory=list)
-    issues: list[str] = Field(default_factory=list)
-    confidence: Confidence = "low"
-
-
-class MedicineAgentState(TypedDict):
-    medicine: MedicineIdentity
-    search_query: str
-    search_results: list[dict]
-    selected_results: list[dict]
-    medicine_information: Optional[MedicineInformation]
-    self_check: Optional[SelfCheckResult]
-    validation: Optional[ValidationResult]
-    retry_count: int
-    final_sources: list[SourceInfo]
-    final_output: dict
-
-
-# -----------------------------------------------------------------------------
-# Model/tool setup
-# -----------------------------------------------------------------------------
-
-GEMINI_MODEL = os.getenv("MEDSCAN_GEMINI_MODEL", "gemini-3.1-flash-lite")
-MAX_CORRECTIVE_RETRIES = int(os.getenv("MEDSCAN_MAX_RETRIES", "1"))
-
-llm = ChatGoogleGenerativeAI(
-    model=GEMINI_MODEL,
-    temperature=0,
+from schemas import (
+    MedicineAgentState,
+    MedicineIdentity,
+    MedicineInformation,
+    SelfCheckResult,
+    SourceEvaluation,
+    SourceInfo,
+    ValidationResult,
 )
 
-source_evaluator_llm = llm.with_structured_output(SourceEvaluation)
-medicine_llm = llm.with_structured_output(MedicineInformation)
-self_check_llm = llm.with_structured_output(SelfCheckResult)
-validator_llm = llm.with_structured_output(ValidationResult)
+load_dotenv()
+logger = logging.getLogger(__name__)
 
-search_tool = TavilySearch(max_results=10, topic="general")
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+MAX_CORRECTIVE_RETRIES = int(os.getenv("MEDSCAN_MAX_RETRIES", "1"))
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Secrets helpers
+# ---------------------------------------------------------------------------
+
+def _get_gemini_key() -> str:
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return os.getenv("GEMINI_API_KEY", "")
+
+
+def _get_tavily_key() -> str:
+    try:
+        return st.secrets["TAVILY_API_KEY"]
+    except Exception:
+        return os.getenv("TAVILY_API_KEY", "")
+
+
+def _configure_langsmith() -> None:
+    """Push LangSmith env vars so the SDK picks them up."""
+    for key in ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT"):
+        value = None
+        try:
+            value = st.secrets[key]
+        except Exception:
+            value = os.getenv(key)
+        if value:
+            os.environ[key] = str(value)
+
+
+# ---------------------------------------------------------------------------
 # Prompts
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 SOURCE_SELECTION_PROMPT = """
 You are MedScan AI's medical source-quality evaluator.
@@ -198,15 +145,14 @@ consequences into this field.
 
 IF YOU TAKE MORE THAN THE RECOMMENDED AMOUNT
 The overdose_risks field represents the user-facing section titled exactly:
-"If You Take More Than the Recommended Amount".
+"What Can Happen If You Take More Than Recommended".
 Only include effects or risks explicitly connected by the evidence to overdose,
 excess dose, or taking too much. Never move ordinary serious adverse reactions
 into this field just because they sound dangerous.
 
 WHEN TO SEEK MEDICAL HELP
 Include evidence-supported urgent warning situations, including serious adverse
-reactions or overdose situations when appropriate. Do not invent emergency
-criteria.
+reactions or overdose situations when appropriate. Do not invent emergency criteria.
 
 DRUG INTERACTIONS / STORAGE
 Include only evidence-supported information.
@@ -217,7 +163,7 @@ medium = credible but incomplete evidence.
 low = identity/evidence is uncertain.
 Writing quality is not evidence quality.
 
-Use concise, patient-friendly English. Translation happens later.
+Use concise, patient-friendly English.
 """
 
 SELF_CHECK_PROMPT = """
@@ -242,9 +188,7 @@ when_to_seek_medical_help, and storage.
 
 Do not require every field to be populated if reliable information genuinely
 cannot be established. If missing/unsupported information could benefit from
-another search, create short targeted corrective_search_terms. Examples:
-"paracetamol tablet storage official label" or
-"paracetamol with or without food official patient information".
+another search, create short targeted corrective_search_terms.
 
 Set is_sufficient=false when important claims are unsupported or important
 retrievable information is missing. Confidence reflects evidence quality.
@@ -271,11 +215,11 @@ if it was not reliably established and is omitted from the user-facing output.
 """
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def medicine_identity_text(medicine: MedicineIdentity) -> str:
+def _medicine_identity_text(medicine: MedicineIdentity) -> str:
     parts: list[str] = []
     for ingredient in medicine.active_ingredients:
         value = ingredient.name.strip()
@@ -287,16 +231,19 @@ def medicine_identity_text(medicine: MedicineIdentity) -> str:
     return " ".join(parts).strip()
 
 
-def format_evidence(results: list[dict]) -> str:
+def _format_evidence(results: list[dict]) -> str:
     blocks: list[str] = []
     for i, result in enumerate(results, 1):
         blocks.append(
-            f"""\n=== SOURCE {i} ===\nTITLE: {result.get('title', '')}\nURL: {result.get('url', '')}\nCONTENT:\n{result.get('content', '')}\n"""
+            f"\n=== SOURCE {i} ===\n"
+            f"TITLE: {result.get('title', '')}\n"
+            f"URL: {result.get('url', '')}\n"
+            f"CONTENT:\n{result.get('content', '')}\n"
         )
     return "\n".join(blocks)
 
 
-def merge_results(existing: list[dict], new: list[dict]) -> list[dict]:
+def _merge_results(existing: list[dict], new: list[dict]) -> list[dict]:
     merged: list[dict] = []
     seen: set[str] = set()
     for item in [*existing, *new]:
@@ -309,8 +256,8 @@ def merge_results(existing: list[dict], new: list[dict]) -> list[dict]:
     return merged
 
 
-def public_output(info: Optional[MedicineInformation], sources: list[SourceInfo]) -> dict:
-    """Remove null/empty values from the user-facing result."""
+def _public_output(info: Optional[MedicineInformation], sources: list[SourceInfo]) -> dict:
+    """Strip null/empty values for user-facing display."""
     if info is None:
         return {"sources": [s.model_dump(exclude_none=True) for s in sources]}
 
@@ -328,217 +275,224 @@ def public_output(info: Optional[MedicineInformation], sources: list[SourceInfo]
     return cleaned
 
 
-# -----------------------------------------------------------------------------
-# Graph nodes
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Cached agent factory
+# ---------------------------------------------------------------------------
 
-def build_search_query(state: MedicineAgentState):
-    medicine = state["medicine"]
-    identity = medicine_identity_text(medicine)
-    query = (
-        f"{identity} official patient medicine information uses mechanism "
-        "with food without food before meal after meal precautions warnings "
-        "pregnancy breastfeeding side effects interactions overdose taking too much storage"
+@st.cache_resource(show_spinner=False)
+def _build_agent():
+    """Build and cache the LangGraph medicine research agent."""
+    _configure_langsmith()
+
+    gemini_key = _get_gemini_key()
+    tavily_key = _get_tavily_key()
+
+    # Set Tavily key in environment so the tool picks it up
+    if tavily_key:
+        os.environ["TAVILY_API_KEY"] = tavily_key
+
+    llm = ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        temperature=0,
+        google_api_key=gemini_key,
     )
-    return {"search_query": query}
 
+    source_evaluator_llm = llm.with_structured_output(SourceEvaluation)
+    medicine_llm = llm.with_structured_output(MedicineInformation)
+    self_check_llm = llm.with_structured_output(SelfCheckResult)
+    validator_llm = llm.with_structured_output(ValidationResult)
+    search_tool = TavilySearch(max_results=10, topic="general")
 
-def search_web(state: MedicineAgentState):
-    response = search_tool.invoke({"query": state["search_query"]})
-    new_results = response.get("results", []) if isinstance(response, dict) else []
-    all_results = merge_results(state.get("search_results", []), new_results)
-    print(f"Search returned {len(new_results)} new results ({len(all_results)} total).")
-    return {"search_results": all_results}
+    # ----------------------------------------------------------------
+    # Graph nodes (closures over cached LLM/tool objects)
+    # ----------------------------------------------------------------
 
-
-def evaluate_sources(state: MedicineAgentState):
-    results = state["search_results"]
-    if not results:
-        return {"selected_results": []}
-
-    candidates = []
-    for i, result in enumerate(results):
-        candidates.append(
-            f"""RESULT INDEX: {i}\nTITLE: {result.get('title', '')}\nURL: {result.get('url', '')}\nCONTENT: {result.get('content', '')[:2500]}\n"""
+    def build_search_query(state: MedicineAgentState):
+        medicine = state["medicine"]
+        identity = _medicine_identity_text(medicine)
+        query = (
+            f"{identity} official patient medicine information uses mechanism "
+            "with food without food before meal after meal precautions warnings "
+            "pregnancy breastfeeding side effects interactions overdose taking too much storage"
         )
+        return {"search_query": query}
 
-    evaluation = source_evaluator_llm.invoke([
-        SystemMessage(content=SOURCE_SELECTION_PROMPT),
-        HumanMessage(content="\n\n".join(candidates)),
-    ])
+    def search_web(state: MedicineAgentState):
+        response = search_tool.invoke({"query": state["search_query"]})
+        new_results = response.get("results", []) if isinstance(response, dict) else []
+        all_results = _merge_results(state.get("search_results", []), new_results)
+        logger.info("Search: %d new results, %d total.", len(new_results), len(all_results))
+        return {"search_results": all_results}
 
-    selected = [
-        results[i]
-        for i in evaluation.selected_indices
-        if isinstance(i, int) and 0 <= i < len(results)
-    ]
-    print(f"Source evaluator selected {len(selected)} results. {evaluation.reason or ''}")
-    return {"selected_results": selected}
+    def evaluate_sources(state: MedicineAgentState):
+        results = state["search_results"]
+        if not results:
+            return {"selected_results": []}
 
+        candidates = []
+        for i, result in enumerate(results):
+            candidates.append(
+                f"RESULT INDEX: {i}\n"
+                f"TITLE: {result.get('title', '')}\n"
+                f"URL: {result.get('url', '')}\n"
+                f"CONTENT: {result.get('content', '')[:2500]}\n"
+            )
 
-def synthesize_information(state: MedicineAgentState):
-    medicine = state["medicine"]
-    results = state["selected_results"]
-    if not results:
-        return {"medicine_information": None}
+        evaluation = source_evaluator_llm.invoke([
+            SystemMessage(content=SOURCE_SELECTION_PROMPT),
+            HumanMessage(content="\n\n".join(candidates)),
+        ])
 
-    ingredients = ", ".join(
-        f"{x.name} {x.strength or ''}".strip() for x in medicine.active_ingredients
-    )
-    prompt = f"""
-MEDICINE FROM PACKAGE
-Brand: {medicine.brand_name or 'Unknown'}
-Active ingredient(s): {ingredients or 'Unknown'}
-Dosage form: {medicine.dosage_form or 'Unknown'}
-Manufacturer: {medicine.manufacturer or 'Unknown'}
-Prescription information from package: {medicine.prescription_status or 'Unknown'}
-OCR/identity confidence: {medicine.confidence or 'Unknown'}
+        selected = [
+            results[i]
+            for i in evaluation.selected_indices
+            if isinstance(i, int) and 0 <= i < len(results)
+        ]
+        logger.info("Source evaluator selected %d results.", len(selected))
+        return {"selected_results": selected}
 
-RETRIEVED EVIDENCE
-{format_evidence(results)}
+    def synthesize_information(state: MedicineAgentState):
+        medicine = state["medicine"]
+        results = state["selected_results"]
+        if not results:
+            return {"medicine_information": None}
 
-Create MedicineInformation using only this evidence.
-"""
-    info = medicine_llm.invoke([
-        SystemMessage(content=MEDICINE_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ])
-    return {"medicine_information": info}
+        ingredients = ", ".join(
+            f"{x.name} {x.strength or ''}".strip()
+            for x in medicine.active_ingredients
+        )
+        prompt = (
+            f"MEDICINE FROM PACKAGE\n"
+            f"Brand: {medicine.brand_name or 'Unknown'}\n"
+            f"Active ingredient(s): {ingredients or 'Unknown'}\n"
+            f"Dosage form: {medicine.dosage_form or 'Unknown'}\n"
+            f"Manufacturer: {medicine.manufacturer or 'Unknown'}\n"
+            f"Prescription information from package: {medicine.prescription_status or 'Unknown'}\n"
+            f"OCR/identity confidence: {medicine.confidence or 'Unknown'}\n\n"
+            f"RETRIEVED EVIDENCE\n{_format_evidence(results)}\n\n"
+            "Create MedicineInformation using only this evidence."
+        )
+        info = medicine_llm.invoke([
+            SystemMessage(content=MEDICINE_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ])
+        return {"medicine_information": info}
 
+    def self_check_information(state: MedicineAgentState):
+        info = state["medicine_information"]
+        if info is None:
+            check = SelfCheckResult(
+                is_sufficient=False,
+                missing_important_fields=["medicine information"],
+                issues=["No suitable evidence was available for synthesis."],
+                corrective_search_terms=[
+                    f"{_medicine_identity_text(state['medicine'])} official drug label patient information"
+                ],
+                confidence="low",
+            )
+            return {"self_check": check}
 
-def self_check_information(state: MedicineAgentState):
-    info = state["medicine_information"]
-    if info is None:
-        check = SelfCheckResult(
-            is_sufficient=False,
-            missing_important_fields=["medicine information"],
-            issues=["No suitable evidence was available for synthesis."],
-            corrective_search_terms=[f"{medicine_identity_text(state['medicine'])} official drug label patient information"],
-            confidence="low",
+        prompt = (
+            f"GENERATED INFORMATION\n{info.model_dump_json(indent=2)}\n\n"
+            f"EVIDENCE\n{_format_evidence(state['selected_results'])}\n\n"
+            "Identify unsupported or important missing information and propose targeted "
+            "corrective searches only when useful."
+        )
+        check = self_check_llm.invoke([
+            SystemMessage(content=SELF_CHECK_PROMPT),
+            HumanMessage(content=prompt),
+        ])
+        logger.info(
+            "Self-check sufficient=%s, confidence=%s, missing=%s",
+            check.is_sufficient,
+            check.confidence,
+            check.missing_important_fields,
         )
         return {"self_check": check}
 
-    prompt = f"""
-GENERATED INFORMATION
-{info.model_dump_json(indent=2)}
-
-EVIDENCE
-{format_evidence(state['selected_results'])}
-
-Identify unsupported or important missing information and propose targeted
-corrective searches only when useful.
-"""
-    check = self_check_llm.invoke([
-        SystemMessage(content=SELF_CHECK_PROMPT),
-        HumanMessage(content=prompt),
-    ])
-    print(
-        f"Self-check sufficient={check.is_sufficient}, confidence={check.confidence}, "
-        f"missing={check.missing_important_fields}, unsupported={check.unsupported_fields}"
-    )
-    return {"self_check": check}
-
-
-def self_check_router(state: MedicineAgentState):
-    check = state["self_check"]
-    if check and check.is_sufficient:
+    def self_check_router(state: MedicineAgentState):
+        check = state["self_check"]
+        if check and check.is_sufficient:
+            return "validate"
+        if state["retry_count"] < MAX_CORRECTIVE_RETRIES:
+            return "correct"
         return "validate"
-    if state["retry_count"] < MAX_CORRECTIVE_RETRIES:
-        return "correct"
-    return "validate"
 
+    def build_corrective_query(state: MedicineAgentState):
+        medicine = state["medicine"]
+        check = state["self_check"]
+        identity = _medicine_identity_text(medicine)
 
-def build_corrective_query(state: MedicineAgentState):
-    medicine = state["medicine"]
-    check = state["self_check"]
-    identity = medicine_identity_text(medicine)
+        terms: list[str] = []
+        if check:
+            terms.extend(check.corrective_search_terms)
+            terms.extend(check.missing_important_fields)
+            terms.extend(check.unsupported_fields)
 
-    terms: list[str] = []
-    if check:
-        terms.extend(check.corrective_search_terms)
-        terms.extend(check.missing_important_fields)
-        terms.extend(check.unsupported_fields)
+        target = " ".join(dict.fromkeys(x.strip() for x in terms if x and x.strip()))
+        if not target:
+            target = "official drug label food administration precautions overdose storage"
 
-    target = " ".join(dict.fromkeys(x.strip() for x in terms if x and x.strip()))
-    if not target:
-        target = "official drug label food administration precautions overdose storage"
+        query = f"{identity} {target}"
+        logger.info("Corrective search #%d: %s", state["retry_count"] + 1, query)
+        return {
+            "search_query": query,
+            "retry_count": state["retry_count"] + 1,
+        }
 
-    query = f"{identity} {target}"
-    print(f"Corrective search #{state['retry_count'] + 1}: {query}")
-    return {
-        "search_query": query,
-        "retry_count": state["retry_count"] + 1,
-    }
-
-
-def validate_information(state: MedicineAgentState):
-    info = state["medicine_information"]
-    if info is None:
-        result = ValidationResult(
-            is_sufficient=False,
-            missing_fields=["medicine information"],
-            issues=["No medicine information could be synthesized."],
-            confidence="low",
-        )
-        return {"validation": result}
-
-    prompt = f"""
-GENERATED INFORMATION
-{info.model_dump_json(indent=2)}
-
-EVIDENCE
-{format_evidence(state['selected_results'])}
-
-Perform the final evidence validation. Missing optional fields may remain omitted,
-but every displayed medical claim must be supported.
-"""
-    validation = validator_llm.invoke([
-        SystemMessage(content=VALIDATOR_PROMPT),
-        HumanMessage(content=prompt),
-    ])
-
-    # Final confidence is controlled by the independent validator.
-    info.confidence = validation.confidence
-    print(
-        f"Final validation sufficient={validation.is_sufficient}, "
-        f"confidence={validation.confidence}, issues={validation.issues}"
-    )
-    return {"validation": validation, "medicine_information": info}
-
-
-def extract_sources(state: MedicineAgentState):
-    sources: list[SourceInfo] = []
-    seen: set[str] = set()
-    for result in state["selected_results"]:
-        url = (result.get("url") or "").strip()
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        domain = urlparse(url).hostname
-        sources.append(
-            SourceInfo(
-                title=result.get("title"),
-                url=url,
-                domain=domain,
+    def validate_information(state: MedicineAgentState):
+        info = state["medicine_information"]
+        if info is None:
+            result = ValidationResult(
+                is_sufficient=False,
+                missing_fields=["medicine information"],
+                issues=["No medicine information could be synthesized."],
+                confidence="low",
             )
+            return {"validation": result}
+
+        prompt = (
+            f"GENERATED INFORMATION\n{info.model_dump_json(indent=2)}\n\n"
+            f"EVIDENCE\n{_format_evidence(state['selected_results'])}\n\n"
+            "Perform the final evidence validation. Missing optional fields may remain omitted, "
+            "but every displayed medical claim must be supported."
         )
-    return {"final_sources": sources}
-
-
-def clean_output(state: MedicineAgentState):
-    return {
-        "final_output": public_output(
-            state.get("medicine_information"),
-            state.get("final_sources", []),
+        validation = validator_llm.invoke([
+            SystemMessage(content=VALIDATOR_PROMPT),
+            HumanMessage(content=prompt),
+        ])
+        info.confidence = validation.confidence
+        logger.info(
+            "Final validation sufficient=%s, confidence=%s",
+            validation.is_sufficient,
+            validation.confidence,
         )
-    }
+        return {"validation": validation, "medicine_information": info}
 
+    def extract_sources(state: MedicineAgentState):
+        sources: list[SourceInfo] = []
+        seen: set[str] = set()
+        for result in state["selected_results"]:
+            url = (result.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            domain = urlparse(url).hostname
+            sources.append(SourceInfo(title=result.get("title"), url=url, domain=domain))
+        return {"final_sources": sources}
 
-# -----------------------------------------------------------------------------
-# Build graph
-# -----------------------------------------------------------------------------
+    def clean_output(state: MedicineAgentState):
+        return {
+            "final_output": _public_output(
+                state.get("medicine_information"),
+                state.get("final_sources", []),
+            )
+        }
 
-def build_medicine_agent():
+    # ----------------------------------------------------------------
+    # Build graph
+    # ----------------------------------------------------------------
+
     builder = StateGraph(MedicineAgentState)
 
     builder.add_node("build_query", build_search_query)
@@ -560,15 +514,10 @@ def build_medicine_agent():
     builder.add_conditional_edges(
         "self_check",
         self_check_router,
-        {
-            "correct": "corrective_query",
-            "validate": "validate",
-        },
+        {"correct": "corrective_query", "validate": "validate"},
     )
 
-    # Corrective retrieval re-runs search -> source grading -> synthesis -> self-check.
     builder.add_edge("corrective_query", "search")
-
     builder.add_edge("validate", "extract_sources")
     builder.add_edge("extract_sources", "clean_output")
     builder.add_edge("clean_output", END)
@@ -576,49 +525,22 @@ def build_medicine_agent():
     return builder.compile()
 
 
-medicine_agent = build_medicine_agent()
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Public API
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def research_medicine(medicine: MedicineIdentity) -> dict:
     """Run the complete medicine research agent and return the graph state."""
-    return medicine_agent.invoke(
-        {
-            "medicine": medicine,
-            "search_query": "",
-            "search_results": [],
-            "selected_results": [],
-            "medicine_information": None,
-            "self_check": None,
-            "validation": None,
-            "retry_count": 0,
-            "final_sources": [],
-            "final_output": {},
-        }
-    )
-
-
-if __name__ == "__main__":
-    # Smoke test without OCR. Replace this object with your OCR/identity output.
-    test_medicine = MedicineIdentity(
-        brand_name="Dolo-650",
-        active_ingredients=[Ingredient(name="Paracetamol", strength="650 mg")],
-        manufacturer="MICRO LABS LIMITED",
-        dosage_form="Tablet",
-        prescription_status=None,
-        confidence="high",
-    )
-
-    result = research_medicine(test_medicine)
-
-    import json
-
-    print("\nFINAL USER-FACING OUTPUT")
-    print(json.dumps(result["final_output"], indent=2, ensure_ascii=False))
-
-    print("\nVALIDATION")
-    if result["validation"]:
-        print(result["validation"].model_dump_json(indent=2))
+    agent = _build_agent()
+    return agent.invoke({
+        "medicine": medicine,
+        "search_query": "",
+        "search_results": [],
+        "selected_results": [],
+        "medicine_information": None,
+        "self_check": None,
+        "validation": None,
+        "retry_count": 0,
+        "final_sources": [],
+        "final_output": {},
+    })

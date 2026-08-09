@@ -1,79 +1,32 @@
+"""Medicine identification module for MedScanAI.
+
+Sends OCR-extracted text to Gemini and returns a structured MedicineIdentity.
+The LLM is initialized once and cached for the lifetime of the Streamlit session.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
 import time
-from typing import Optional, Literal
+from typing import Optional
 
+import streamlit as st
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
 
+from schemas import Ingredient, MedicineIdentity  # noqa: F401 (re-exported)
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 
-# ============================================================
-# DATA MODELS
-# ============================================================
-
-class Ingredient(BaseModel):
-    name: str
-    strength: Optional[str] = None
-
-
-class MedicineIdentity(BaseModel):
-    brand_name: Optional[str] = None
-
-    active_ingredients: list[Ingredient] = Field(
-        default_factory=list
-    )
-
-    manufacturer: Optional[str] = None
-
-    dosage_form: Optional[str] = None
-
-    prescription_status: Optional[str] = None
-
-    confidence: Literal[
-        "high",
-        "medium",
-        "low"
-    ] = "low"
-
-
-# ============================================================
-# GEMINI CONFIGURATION
-# ============================================================
-
-GEMINI_MODEL = os.getenv(
-    "MEDSCAN_GEMINI_MODEL",
-    "gemini-3.1-flash-lite"
-)
-
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY"
-)
-
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not set in the environment."
-    )
-
-
-llm = ChatGoogleGenerativeAI(
-    model=GEMINI_MODEL,
-    temperature=0,
-    google_api_key=GEMINI_API_KEY
-)
-
-
-structured_llm = llm.with_structured_output(
-    MedicineIdentity
-)
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
 
 MEDICINE_IDENTITY_PROMPT = """
 You are the Medicine Identification module of MedScan AI.
@@ -103,17 +56,8 @@ Brophyle-N
 Crocin
 Augmentin 625
 
-Do not confuse:
-
-- manufacturer
-- marketer
-- distributor
-- pharmacy
-- retailer
-- company name
-- slogan
-
-with the medicine brand name.
+Do not confuse manufacturer, marketer, distributor, pharmacy, retailer,
+company name, or slogan with the medicine brand name.
 
 If the brand cannot be established reliably, return null.
 
@@ -133,29 +77,10 @@ Look for packaging phrases such as:
 - Contains
 - Each film-coated tablet contains
 
-Examples:
-
-Dolo-650:
-Paracetamol 650 mg
-
-Brophyle-N:
-Acebrophylline 100 mg
-Acetylcysteine 600 mg
-
-Amoxil-500:
-Amoxicillin 500 mg
-
 IMPORTANT:
 
-Do not treat these as active ingredients:
-
-- excipients
-- preservatives
-- colours
-- flavours
-- inactive ingredients
-- manufacturer names
-- company names
+Do not treat excipients, preservatives, colours, flavours, inactive
+ingredients, or manufacturer names as active ingredients.
 
 If multiple active ingredients are present, extract ALL of them.
 
@@ -164,16 +89,6 @@ If multiple active ingredients are present, extract ALL of them.
 ============================================================
 
 Extract the strength corresponding to each active ingredient.
-
-Examples:
-
-650 mg
-500 mg
-10 mg
-250 mg/5 mL
-100 mg + 600 mg
-
-Do not randomly associate numbers with ingredients.
 
 Only associate a strength with an ingredient when the packaging
 evidence supports the relationship.
@@ -184,19 +99,8 @@ evidence supports the relationship.
 
 Identify the dosage form when supported by the OCR text.
 
-Examples:
-
-Tablet
-Film-coated tablet
-Capsule
-Syrup
-Suspension
-Injection
-Cream
-Ointment
-Gel
-Drops
-Inhaler
+Examples: Tablet, Film-coated tablet, Capsule, Syrup, Suspension,
+Injection, Cream, Ointment, Gel, Drops, Inhaler.
 
 Do not infer the dosage form only from the brand name.
 
@@ -206,20 +110,9 @@ Do not infer the dosage form only from the brand name.
 
 Identify the actual manufacturer when it is clearly stated.
 
-Look for:
+Look for: Manufactured by, Mfg. by, Manufactured at, A product of.
 
-- Manufactured by
-- Mfg. by
-- Manufactured at
-- A product of
-
-Do not confuse the manufacturer with:
-
-- marketer
-- distributor
-- retailer
-- pharmacy
-
+Do not confuse with marketer, distributor, retailer, or pharmacy.
 If only a marketer is visible, manufacturer may remain null.
 
 ============================================================
@@ -229,15 +122,7 @@ If only a marketer is visible, manufacturer may remain null.
 Only identify prescription status when it is explicitly visible
 or clearly stated in the OCR text.
 
-Examples:
-
-Schedule H
-Schedule H1
-Schedule H Prescription Drug
-Rx
-Prescription only medicine
-
-Do NOT determine prescription status from general medical knowledge.
+Examples: Schedule H, Schedule H1, Rx, Prescription only medicine.
 
 If prescription status is not visible, return null.
 
@@ -245,17 +130,9 @@ If prescription status is not visible, return null.
 7. OCR ERROR HANDLING
 ============================================================
 
-OCR may produce errors such as:
-
-"Dolo 650" instead of "Dolo-650"
-"Paracetamo1" instead of "Paracetamol"
-"Acetylcystein" instead of "Acetylcysteine"
-
 You may correct obvious OCR errors when the surrounding packaging
-evidence strongly supports the correction.
-
-However, do NOT invent a medicine identity merely because the name
-resembles a known medicine.
+evidence strongly supports the correction. However, do NOT invent a
+medicine identity merely because the name resembles a known medicine.
 
 If the OCR contains conflicting medicine names or ingredients,
 reduce confidence.
@@ -264,97 +141,34 @@ reduce confidence.
 8. CONFIDENCE
 ============================================================
 
-HIGH:
+HIGH: brand name, active ingredients, and strengths are all clearly
+supported and the OCR evidence is consistent.
 
-Use high only when:
+MEDIUM: medicine is probably identifiable but some packaging
+information is incomplete or OCR contains moderate ambiguity.
 
-- brand name is clearly supported
-- active ingredient(s) are clearly supported
-- strength(s) are clearly supported
-- OCR evidence is consistent
-
-MEDIUM:
-
-Use medium when:
-
-- the medicine is probably identifiable
-- but some packaging information is incomplete
-- or OCR contains moderate ambiguity
-
-LOW:
-
-Use low when:
-
-- medicine identity is uncertain
-- OCR is badly corrupted
-- ingredients conflict
-- brand and ingredients do not agree
-- identification requires significant guessing
-
-Never choose high merely because you recognize a medicine.
+LOW: medicine identity is uncertain, OCR is badly corrupted,
+ingredients conflict, or identification requires significant guessing.
 
 ============================================================
 9. CRITICAL RULE: DO NOT INVENT
 ============================================================
 
-This is extremely important.
+Do NOT fill missing packaging information using your general knowledge.
 
-Do NOT fill missing packaging information using your general
-knowledge.
-
-Example:
-
-OCR says:
-
-Dolo-650
-Paracetamol 650 mg
-
-but the manufacturer cannot be read.
-
-Correct:
-
-manufacturer = null
-
-Incorrect:
-
-manufacturer = "MICRO LABS LIMITED"
-
-even if you know that Dolo-650 is commonly manufactured by
-Micro Labs.
+Example: if the manufacturer cannot be read from the OCR text,
+return manufacturer = null even if you know who makes this medicine.
 
 The identification module describes what can be established from
-the scanned package.
-
-The research agent is responsible for retrieving additional
-medicine information later.
+the scanned package only.
 
 ============================================================
 10. COMBINATION MEDICINES
 ============================================================
 
-If the package contains multiple active ingredients:
-
-- extract every active ingredient
-- preserve each ingredient's strength
-- do not merge them into one ingredient
-- do not omit a second ingredient
-
-For example:
-
-Brophyle-N
-
-must become:
-
-active_ingredients = [
-    {
-        "name": "Acebrophylline",
-        "strength": "100 mg"
-    },
-    {
-        "name": "Acetylcysteine",
-        "strength": "600 mg"
-    }
-]
+If the package contains multiple active ingredients, extract every
+active ingredient and preserve each ingredient's strength separately.
+Do not merge them into one ingredient.
 
 ============================================================
 FINAL RULE
@@ -362,59 +176,56 @@ FINAL RULE
 
 Return only the MedicineIdentity structure.
 
-Do not provide:
-
-- uses
-- dosage instructions
-- side effects
-- precautions
-- interactions
-- medical advice
-- explanations
-
-Those will be generated later by the medicine research agent.
+Do not provide uses, dosage instructions, side effects, precautions,
+interactions, or medical advice.
 """
 
 
-# ============================================================
-# IDENTIFY MEDICINE
-# ============================================================
+# ---------------------------------------------------------------------------
+# Cached LLM initialization
+# ---------------------------------------------------------------------------
 
-def identify_medicine(
-    ocr_text: str,
-    max_retries: int = 2
-) -> Optional[MedicineIdentity]:
+def _get_api_key() -> str:
+    """Read GEMINI_API_KEY from st.secrets (Cloud) or environment (local)."""
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return os.getenv("GEMINI_API_KEY", "")
 
-    """
-    Identify medicine information from PaddleOCR text.
+
+@st.cache_resource(show_spinner=False)
+def _get_structured_llm():
+    """Initialize and cache the structured Gemini LLM."""
+    api_key = _get_api_key()
+    llm = ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        temperature=0,
+        google_api_key=api_key,
+    )
+    return llm.with_structured_output(MedicineIdentity)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def identify_medicine(ocr_text: str, max_retries: int = 2) -> Optional[MedicineIdentity]:
+    """Identify medicine information from OCR-extracted text.
 
     Parameters
     ----------
     ocr_text:
         Raw text extracted from medicine packaging.
-
     max_retries:
         Number of retries for Gemini rate-limit errors.
 
     Returns
     -------
     MedicineIdentity | None
+        None when identification fails or confidence is too low.
     """
-
-    if not ocr_text:
-        print(
-            "Medicine identification skipped: "
-            "OCR text is empty."
-        )
-        return None
-
-    ocr_text = ocr_text.strip()
-
-    if len(ocr_text) < 3:
-        print(
-            "Medicine identification skipped: "
-            "OCR text is too short."
-        )
+    if not ocr_text or len(ocr_text.strip()) < 3:
+        logger.info("Medicine identification skipped: OCR text is empty or too short.")
         return None
 
     user_prompt = f"""
@@ -422,9 +233,9 @@ Identify the medicine from the following OCR text.
 
 ================ OCR TEXT ================
 
-{ocr_text}
+{ocr_text.strip()}
 
-===========================================
+==========================================
 
 Follow all medicine-identification rules.
 
@@ -441,150 +252,40 @@ Important:
 - Assign confidence according to the evidence quality.
 """
 
+    structured_llm = _get_structured_llm()
+
     for attempt in range(max_retries + 1):
-
         try:
-
-            medicine = structured_llm.invoke(
-                [
-                    SystemMessage(
-                        content=MEDICINE_IDENTITY_PROMPT
-                    ),
-                    HumanMessage(
-                        content=user_prompt
-                    )
-                ]
-            )
+            medicine = structured_llm.invoke([
+                SystemMessage(content=MEDICINE_IDENTITY_PROMPT),
+                HumanMessage(content=user_prompt),
+            ])
 
             if medicine is None:
-                print(
-                    "Gemini returned no medicine identity."
-                )
+                logger.warning("Gemini returned no medicine identity.")
                 return None
 
-            # ----------------------------------------
-            # BASIC VALIDATION
-            # ----------------------------------------
-
-            has_brand = bool(
-                medicine.brand_name
-            )
-
-            has_ingredients = bool(
-                medicine.active_ingredients
-            )
+            has_brand = bool(medicine.brand_name)
+            has_ingredients = bool(medicine.active_ingredients)
 
             if not has_brand and not has_ingredients:
-
-                print(
-                    "Could not reliably identify "
-                    "the medicine."
-                )
-
+                logger.warning("Could not reliably identify the medicine.")
                 return None
 
             return medicine
 
-        except Exception as e:
+        except Exception as exc:
+            error_text = str(exc)
 
-            error_text = str(e)
-
-            # ----------------------------------------
-            # RATE LIMIT
-            # ----------------------------------------
-
-            if (
-                "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text
-            ):
-
+            if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
                 if attempt >= max_retries:
-
-                    print(
-                        "Gemini rate limit reached. "
-                        "Maximum retries exceeded."
-                    )
-
+                    logger.error("Gemini rate limit reached. Maximum retries exceeded.")
                     return None
-
-                wait_time = 65
-
-                print(
-                    f"Gemini rate limit reached. "
-                    f"Waiting {wait_time} seconds "
-                    f"before retry..."
-                )
-
-                time.sleep(wait_time)
-
-            # ----------------------------------------
-            # OTHER ERROR
-            # ----------------------------------------
-
+                wait = 65
+                logger.warning("Gemini rate limit. Waiting %d s before retry…", wait)
+                time.sleep(wait)
             else:
-
-                print(
-                    "Medicine identification error:"
-                )
-
-                print(e)
-
+                logger.error("Medicine identification error: %s", exc)
                 return None
 
     return None
-
-
-# ============================================================
-# HELPER FUNCTION
-# ============================================================
-
-def medicine_identity_to_dict(
-    medicine: MedicineIdentity
-) -> dict:
-
-    """
-    Convert MedicineIdentity to a normal dictionary.
-    Useful for Streamlit/API responses.
-    """
-
-    return medicine.model_dump(
-        exclude_none=True
-    )
-
-
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    test_ocr_text = """
-    DOLO-650
-    Paracetamol Tablets IP 650 mg
-    Each tablet contains:
-    Paracetamol IP 650 mg
-    Manufactured by MICRO LABS LIMITED
-    """
-
-    print(
-        f"Using Gemini model: {GEMINI_MODEL}"
-    )
-
-    medicine = identify_medicine(
-        test_ocr_text
-    )
-
-    if medicine:
-
-        print("\nMedicine identified:")
-        print(
-            medicine.model_dump_json(
-                indent=2
-            )
-        )
-
-    else:
-
-        print(
-            "\nMedicine identification failed."
-        )
