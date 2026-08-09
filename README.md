@@ -82,13 +82,6 @@ streamlit run app.py
 
 ---
 
-## Deployment (Streamlit Community Cloud)
-
-1. Push this project to a GitHub repository.
-2. Go to [share.streamlit.io](https://share.streamlit.io) and create a new app.
-3. Set the entry point to `app.py`.
-4. Add your secrets in **App settings → Secrets**:
-
 ```toml
 GEMINI_API_KEY = "your_key_here"
 TAVILY_API_KEY = "your_key_here"
